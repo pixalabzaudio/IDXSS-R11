@@ -1,4 +1,4 @@
-'''
+
 import yfinance as yf
 import streamlit as st
 import pandas as pd
@@ -32,7 +32,7 @@ BATCH_SIZE = 50
 
 # --- Helper function for Wilder's RSI ---
 def calculate_rsi_wilder(prices, period=RSI_PERIOD):
-    """Calculate RSI using Wilder's smoothing method."""
+    '''Calculate RSI using Wilder's smoothing method.'''
     delta = prices.diff()
     delta = delta[1:]
     gain = delta.where(delta > 0, 0)
@@ -68,10 +68,10 @@ def calculate_rsi_wilder(prices, period=RSI_PERIOD):
 # Cache technical data for 5 minutes (300 seconds)
 @st.cache_data(ttl=300)
 def get_rsi(ticker):
-    """
+    '''
     Calculate RSI for a given ticker using Wilder's smoothing.
     Returns: (rsi_value, signal, rsi_history) or None if data unavailable or calculation fails
-    """
+    '''
     try:
         stock = yf.Ticker(ticker)
         # Fetch enough history for RSI calculation (RSI_PERIOD + lookback for initial SMA)
@@ -126,10 +126,10 @@ def get_rsi(ticker):
 # Cache fundamentals data for 24 hours (86400 seconds)
 @st.cache_data(ttl=86400)
 def get_fundamentals(ticker):
-    """
+    '''
     Retrieve fundamental financial data for a given ticker.
     Returns: (net_income, prev_net_income, pe_ratio, pb_ratio) or None if essential data unavailable/invalid
-    """
+    '''
     try:
         stock = yf.Ticker(ticker)
         info = stock.info
@@ -187,10 +187,10 @@ def get_fundamentals(ticker):
 
 
 def process_ticker_technical_first(ticker, rsi_min, rsi_max, show_oversold, show_overbought, show_neutral):
-    """
+    '''
     Process a single ticker with technical filters first.
     Returns: [ticker_symbol, rsi, signal, rsi_history] or None if not matching criteria
-    """
+    '''
     try:
         rsi_data = get_rsi(ticker)
         if not rsi_data:
@@ -217,10 +217,10 @@ def process_ticker_technical_first(ticker, rsi_min, rsi_max, show_oversold, show
         return None
 
 def apply_fundamental_filters(technical_results, min_ni, max_pe, max_pb, min_growth):
-    """
+    '''
     Apply fundamental filters to stocks that passed technical screening.
     Returns: List of stocks with both technical and fundamental data
-    """
+    '''
     final_results = []
 
     for result in technical_results:
@@ -292,7 +292,7 @@ def apply_fundamental_filters(technical_results, min_ni, max_pe, max_pb, min_gro
 
 @st.cache_data(ttl=300)
 def create_rsi_chart_image(rsi_values, current_rsi):
-    """Create a matplotlib chart for RSI values and return as image bytes"""
+    '''Create a matplotlib chart for RSI values and return as image bytes'''
     if isinstance(rsi_values, list):
         rsi_values = np.array(rsi_values)
 
@@ -344,7 +344,7 @@ def create_rsi_chart_image(rsi_values, current_rsi):
     return buf
 
 def process_batch_technical_first(batch_tickers, rsi_min, rsi_max, show_oversold, show_overbought, show_neutral):
-    """Process a batch of tickers with technical filters first."""
+    '''Process a batch of tickers with technical filters first.'''
     results = []
     process_func = partial(
         process_ticker_technical_first,
@@ -379,7 +379,7 @@ def main():
     )
 
     # Custom CSS (minor adjustments if needed)
-    st.markdown("""
+    st.markdown('''
     <style>
     /* Make header sticky */
     .stDataFrame th {
@@ -412,7 +412,7 @@ def main():
         width: 100%;
     }
     </style>
-    """, unsafe_allow_html=True)
+    ''', unsafe_allow_html=True)
 
     # App header
     col1, col2 = st.columns([3, 1])
@@ -499,13 +499,13 @@ def main():
 
     with main_tab2:
         st.subheader("About IDX Stock Screener V2")
-        st.markdown(f"""
+        st.markdown(f'''
         This application screens all **{len(IDX_ALL_TICKERS_YF)}** stocks listed on the Indonesia Stock Exchange (IDX).
         - **Technical Screening (First Pass):** Filters by RSI({RSI_PERIOD}) value and signal (Oversold < {OVERSOLD_THRESHOLD}, Overbought > {OVERBOUGHT_THRESHOLD}). Uses Wilder's Smoothing.
         - **Fundamental Screening (Second Pass):** Applies filters for Net Income, P/E Ratio, P/B Ratio, and YoY Growth to the stocks that passed the technical screen.
         - **Data:** Uses `yfinance` API. Technical data cached for 5 mins, Fundamental data for 24 hours.
         - **Improvements (V2):** Relaxed default filters, improved data validation, clearer logging for missing data and filtering reasons, better 'no results' guidance.
-        """)
+        ''')
 
         st.subheader("Current Filter Settings")
         filter_summary = st.session_state.filter_settings.copy()
@@ -725,27 +725,22 @@ def main():
         else: # No results cache yet (initial load)
              st.info("Click 'Run Screener Now' in the sidebar to start.")
 
-
+# Standard Python entry point
 if __name__ == "__main__":
-    main()
-
-'''
-
-
-# --- Enhanced Error Catching Wrapper ---
-try:
-    print("Attempting to run main() function...")
-    main()
-    print("main() function completed without top-level error.")
-except Exception as e:
-    print(f"ERROR: An exception occurred at the top level: {e}")
-    import streamlit as st
-    import traceback
-    st.set_page_config(page_title="App Error", layout="wide")
-    st.title("🚨 Application Error")
-    st.error("An unexpected error occurred while running the application. Please see the details below:")
-    st.exception(e)
-    print("--- TRACEBACK START ---")
-    traceback.print_exc() # Print traceback to logs
-    print("--- TRACEBACK END ---")
+    # --- Enhanced Error Catching Wrapper ---
+    try:
+        print("Attempting to run main() function...")
+        main()
+        print("main() function completed without top-level error.")
+    except Exception as e:
+        print(f"ERROR: An exception occurred while running main(): {e}")
+        # Display error in Streamlit app
+        st.set_page_config(page_title="App Error", layout="wide")
+        st.title("🚨 Application Error")
+        st.error("An unexpected error occurred while running the application. Please see the details below:")
+        st.exception(e)
+        # Also print traceback to logs for debugging
+        print("--- TRACEBACK START ---")
+        traceback.print_exc()
+        print("--- TRACEBACK END ---")
 
