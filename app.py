@@ -1,9 +1,5 @@
 
-import sys
-sys.path.append("/opt/.manus/.sandbox-runtime") # Add path for ApiClient
-from data_api import ApiClient # Import ApiClient
-
-import yfinance as yf # Keep yfinance for fundamentals
+import yfinance as yf
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -34,12 +30,10 @@ OVERBOUGHT_THRESHOLD = 70
 MAX_WORKERS = 10
 BATCH_SIZE = 50
 
-# Instantiate API Client (outside function to reuse)
-api_client = ApiClient()
-
 # --- Helper function for Wilder's RSI ---
-def calculate_rsi_wilder(prices, period=RSI_PERIOD):
+def calculate_rsi_wilder(prices, period=RSI_PERIOD, ticker="N/A"):
     '''Calculate RSI using Wilder's smoothing method.'''
+    print(f"[{ticker}] Calculating RSI Wilder: Input prices length = {len(prices)}")
     delta = prices.diff()
     delta = delta[1:]
     gain = delta.where(delta > 0, 0)
@@ -47,40 +41,42 @@ def calculate_rsi_wilder(prices, period=RSI_PERIOD):
 
     # Check if enough data for initial SMA
     if len(gain) < period:
-        return pd.Series(dtype=float) # Return empty series if not enough data
+        print(f"[{ticker}] RSI Wilder Error: Not enough gain/loss data (need {period}, got {len(gain)}).")
+        return pd.Series(dtype=float)
 
     # Calculate initial average gain and loss using SMA
     try:
-        # Ensure rolling calculation doesn't produce all NaNs if data has gaps
         avg_gain_series = gain.rolling(window=period, min_periods=period).mean()
         avg_loss_series = loss.rolling(window=period, min_periods=period).mean()
         
-        # Find the first valid index after the rolling period
         first_valid_index = period - 1
         while first_valid_index < len(avg_gain_series) and pd.isna(avg_gain_series.iloc[first_valid_index]):
             first_valid_index += 1
             
         if first_valid_index >= len(avg_gain_series):
-             return pd.Series(dtype=float) # Not enough valid data points after rolling
+             print(f"[{ticker}] RSI Wilder Error: Not enough valid data points after rolling SMA.")
+             return pd.Series(dtype=float)
              
         avg_gain = avg_gain_series.iloc[first_valid_index]
         avg_loss = avg_loss_series.iloc[first_valid_index]
         
         if pd.isna(avg_gain) or pd.isna(avg_loss):
-             return pd.Series(dtype=float) # Initial SMA failed
+             print(f"[{ticker}] RSI Wilder Error: Initial SMA calculation resulted in NaN (AvgGain: {avg_gain}, AvgLoss: {avg_loss}).")
+             return pd.Series(dtype=float)
 
-    except IndexError:
-        return pd.Series(dtype=float) # Not enough data
+        print(f"[{ticker}] RSI Wilder Initial AvgGain: {avg_gain:.4f}, AvgLoss: {avg_loss:.4f}")
+
+    except Exception as e:
+        print(f"[{ticker}] RSI Wilder Error during initial SMA: {e}")
+        return pd.Series(dtype=float)
 
     # Initialize arrays for Wilder's averages
     wilder_avg_gain = np.array([avg_gain])
     wilder_avg_loss = np.array([avg_loss])
 
     # Calculate subsequent averages using Wilder's smoothing
-    # Start from the data point after the initial SMA window
-    start_calc_index = first_valid_index + 1 
+    start_calc_index = first_valid_index + 1
     for i in range(start_calc_index, len(gain)):
-        # Handle potential NaNs in gain/loss data
         current_gain = gain.iloc[i] if not pd.isna(gain.iloc[i]) else 0
         current_loss = loss.iloc[i] if not pd.isna(loss.iloc[i]) else 0
         
@@ -94,101 +90,90 @@ def calculate_rsi_wilder(prices, period=RSI_PERIOD):
     rsi = 100 - (100 / (1 + rs))
 
     # Return the full RSI series aligned with the original price index
-    # The index should correspond to the days for which RSI was calculated
     rsi_index = prices.index[start_calc_index + 1 : start_calc_index + 1 + len(rsi)]
     if len(rsi) != len(rsi_index):
-         # Fallback if index alignment is tricky, just return values
-         # This might happen with gaps, return the calculated values
-         return pd.Series(rsi)
-         
-    return pd.Series(rsi, index=rsi_index)
+         print(f"[{ticker}] RSI Wilder Warning: Index alignment mismatch (RSI len {len(rsi)}, Index len {len(rsi_index)}). Returning values only.")
+         rsi_series = pd.Series(rsi)
+    else:
+        rsi_series = pd.Series(rsi, index=rsi_index)
+        
+    print(f"[{ticker}] RSI Wilder Calculation successful. Output series length: {len(rsi_series)}")
+    # print(f"[{ticker}] RSI Wilder Output Head:\n{rsi_series.head()}") # Optional: Log head/tail if needed
+    # print(f"[{ticker}] RSI Wilder Output Tail:\n{rsi_series.tail()}")
+    return rsi_series
 
 
 # Cache technical data for 5 minutes (300 seconds)
 @st.cache_data(ttl=300)
-def get_rsi_from_api(ticker):
+def get_rsi_yfinance(ticker):
     '''
-    Calculate RSI for a given ticker using Wilder's smoothing, fetching data via API.
+    Calculate RSI for a given ticker using Wilder's smoothing (yfinance version with enhanced logging).
     Returns: (rsi_value, signal, rsi_history) or None if data unavailable or calculation fails
     '''
+    print(f"[{ticker}] --- Starting get_rsi_yfinance --- ")
     try:
-        # Fetch 6 months of daily data using the API
-        print(f"Fetching data for {ticker} via API...") # Log API call start
-        stock_data = api_client.call_api(
-            'YahooFinance/get_stock_chart',
-            query={
-                'symbol': ticker,
-                'interval': '1d',
-                'range': '6mo', # Fetch 6 months for RSI calculation
-                'includeAdjustedClose': True
-            }
-        )
-        print(f"API response received for {ticker}.") # Log API call end
+        print(f"[{ticker}] Initializing yf.Ticker...")
+        stock = yf.Ticker(ticker)
+        if not stock:
+             print(f"[{ticker}] yf.Ticker initialization failed.")
+             st.session_state.setdefault("errors", {})
+             st.session_state.errors[ticker] = f"RSI Error: yf.Ticker initialization failed."
+             return None
+             
+        # Fetch enough history for RSI calculation
+        fetch_period = "6mo"
+        fetch_interval = "1d"
+        print(f"[{ticker}] Fetching history: period='{fetch_period}', interval='{fetch_interval}'...")
+        hist = stock.history(period=fetch_period, interval=fetch_interval)
+        print(f"[{ticker}] History fetched. Shape: {hist.shape}")
 
-        # Validate API response structure
-        if not stock_data or 'chart' not in stock_data or 'result' not in stock_data['chart'] or not stock_data['chart']['result']:
+        if hist.empty:
+            print(f"[{ticker}] RSI Error: Fetched history is empty.")
             st.session_state.setdefault("errors", {})
-            st.session_state.errors[ticker] = f"API Error: Invalid or empty response structure."
-            print(f"API Error for {ticker}: Invalid response structure.")
-            return None
-
-        result = stock_data['chart']['result'][0]
-        if 'timestamp' not in result or 'indicators' not in result or 'quote' not in result['indicators'] or not result['indicators']['quote']:
-            st.session_state.setdefault("errors", {})
-            st.session_state.errors[ticker] = f"API Error: Missing timestamps or indicators/quote data."
-            print(f"API Error for {ticker}: Missing timestamps/indicators.")
-            return None
-
-        quote = result['indicators']['quote'][0]
-        timestamps = result['timestamp']
-        close_prices = quote.get('close')
-
-        if not timestamps or not close_prices or len(timestamps) != len(close_prices):
-            st.session_state.setdefault("errors", {})
-            st.session_state.errors[ticker] = f"API Error: Timestamps/Close price mismatch or missing (T:{len(timestamps)}, C:{len(close_prices) if close_prices else 0})."
-            print(f"API Error for {ticker}: Timestamps/Close price mismatch.")
+            st.session_state.errors[ticker] = f"RSI Error: Fetched history is empty."
             return None
             
-        # Filter out null close prices and corresponding timestamps
-        valid_indices = [i for i, price in enumerate(close_prices) if price is not None]
-        if not valid_indices:
+        if "Close" not in hist.columns:
+            print(f"[{ticker}] RSI Error: 'Close' column not found in fetched history.")
             st.session_state.setdefault("errors", {})
-            st.session_state.errors[ticker] = f"API Error: No valid close prices found."
-            print(f"API Error for {ticker}: No valid close prices.")
+            st.session_state.errors[ticker] = f"RSI Error: 'Close' column not found in history."
             return None
             
-        valid_timestamps = [timestamps[i] for i in valid_indices]
-        valid_close_prices = [close_prices[i] for i in valid_indices]
+        close_prices = hist["Close"].dropna() # Drop NaNs from close prices
+        print(f"[{ticker}] Close prices extracted. Length after dropna: {len(close_prices)}")
+        # print(f"[{ticker}] Close prices tail:\n{close_prices.tail()}") # Optional: Log tail
 
-        # Create Pandas Series with datetime index
-        hist_close = pd.Series(valid_close_prices, index=pd.to_datetime(valid_timestamps, unit='s'))
-        print(f"Created price series for {ticker} with {len(hist_close)} points.")
-
-        if hist_close.empty or len(hist_close) < RSI_PERIOD + 1:
+        if len(close_prices) < RSI_PERIOD + 1:
+            print(f"[{ticker}] RSI Error: Not enough valid historical data points (need {RSI_PERIOD + 1}, got {len(close_prices)}).")
             st.session_state.setdefault("errors", {})
-            st.session_state.errors[ticker] = f"RSI Error: Not enough valid historical data from API (need {RSI_PERIOD + 1}, got {len(hist_close)})."
-            print(f"RSI Error for {ticker}: Not enough data ({len(hist_close)}).")
+            st.session_state.errors[ticker] = f"RSI Error: Not enough valid historical data (need {RSI_PERIOD + 1}, got {len(close_prices)})."
             return None
 
         # Calculate RSI using Wilder's method
-        print(f"Calculating RSI for {ticker}...")
-        rsi_series = calculate_rsi_wilder(hist_close, period=RSI_PERIOD)
-        print(f"RSI calculation done for {ticker}.")
+        print(f"[{ticker}] Calling calculate_rsi_wilder...")
+        rsi_series = calculate_rsi_wilder(close_prices, period=RSI_PERIOD, ticker=ticker)
 
         if rsi_series.empty or rsi_series.isna().all():
+            print(f"[{ticker}] RSI Error: Wilder calculation resulted in empty or all-NaN series.")
             st.session_state.setdefault("errors", {})
-            st.session_state.errors[ticker] = f"RSI Error: Calculation resulted in empty or NaN series."
-            print(f"RSI Error for {ticker}: Empty/NaN RSI series.")
+            st.session_state.errors[ticker] = f"RSI Error: Wilder calculation resulted in empty or NaN series."
             return None
 
         # Get the latest RSI value
-        latest_rsi = rsi_series.iloc[-1]
+        try:
+            latest_rsi = rsi_series.iloc[-1]
+            print(f"[{ticker}] Latest RSI value extracted: {latest_rsi:.2f}")
+        except IndexError:
+            print(f"[{ticker}] RSI Error: Could not get latest RSI value from series (IndexError). Series length: {len(rsi_series)}")
+            st.session_state.setdefault("errors", {})
+            st.session_state.errors[ticker] = f"RSI Error: Could not get latest RSI value (IndexError)."
+            return None
 
         # Check if latest RSI is valid
         if pd.isna(latest_rsi):
+             print(f"[{ticker}] RSI Error: Latest RSI value is NaN.")
              st.session_state.setdefault("errors", {})
              st.session_state.errors[ticker] = f"RSI Error: Latest RSI value is NaN."
-             print(f"RSI Error for {ticker}: Latest RSI is NaN.")
              return None
 
         # Determine signal based on RSI value
@@ -198,135 +183,167 @@ def get_rsi_from_api(ticker):
             signal = "Overbought"
         else:
             signal = "Neutral"
+        print(f"[{ticker}] RSI Signal determined: {signal}")
 
         # Return latest RSI, signal, and the last RSI_PERIOD values for the chart
         rsi_history = rsi_series.dropna().tail(RSI_PERIOD).values
         if len(rsi_history) == 0:
+             print(f"[{ticker}] RSI Error: No valid RSI history values found for chart after dropna/tail.")
              st.session_state.setdefault("errors", {})
              st.session_state.errors[ticker] = f"RSI Error: No valid RSI history values found for chart."
-             print(f"RSI Error for {ticker}: No valid RSI history.")
              return None # Cannot create chart without history
+        print(f"[{ticker}] RSI History extracted for chart. Length: {len(rsi_history)}")
 
-        print(f"Successfully processed {ticker}: RSI={latest_rsi:.1f}, Signal={signal}")
+        print(f"[{ticker}] --- Successfully completed get_rsi_yfinance --- ")
         return (latest_rsi, signal, rsi_history)
 
     except Exception as e:
+        error_msg = f"RSI yfinance Error: {e}\n{traceback.format_exc()}"
+        print(f"[{ticker}] !!! EXCEPTION in get_rsi_yfinance: {error_msg}")
         st.session_state.setdefault("errors", {})
-        error_msg = f"RSI API/Calc Error: {e}\n{traceback.format_exc()}"
         st.session_state.errors[ticker] = error_msg
-        print(f"Error processing {ticker}: {error_msg}") # Print error to logs
         return None
 
-# Cache fundamentals data for 24 hours (86400 seconds) - KEEP USING YFINANCE FOR NOW
+# Cache fundamentals data for 24 hours (86400 seconds) - KEEP USING YFINANCE
 @st.cache_data(ttl=86400)
 def get_fundamentals(ticker):
     '''
     Retrieve fundamental financial data for a given ticker using yfinance.
     Returns: (net_income, prev_net_income, pe_ratio, pb_ratio) or None if essential data unavailable/invalid
     '''
+    print(f"[{ticker}] --- Starting get_fundamentals --- ")
     try:
         stock = yf.Ticker(ticker)
         info = stock.info
         financials = stock.financials
         # balance_sheet = stock.balance_sheet # Not currently used
+        print(f"[{ticker}] yfinance info and financials fetched.")
 
         # Initialize metrics
         net_income, prev_net_income, pe_ratio, pb_ratio = None, 0, None, None # Default prev_ni to 0
 
         # --- Net Income ---
-        if not financials.empty and "Net Income" in financials.index and len(financials.loc["Net Income"]) > 0:
-            try:
-                # Handle potential MultiIndex or different structures
-                ni_series = financials.loc["Net Income"]
-                if isinstance(ni_series, pd.Series):
-                    net_income = ni_series.iloc[0] / 1e12 # Current NI in Trillion IDR
-                    if len(ni_series) > 1:
-                        prev_net_income = ni_series.iloc[1] / 1e12 # Previous NI in Trillion IDR
-                    else:
-                        st.session_state.setdefault("warnings", {})
-                        st.session_state.warnings[ticker] = f"Fund. Warning: Previous Net Income missing, growth calculation may be inaccurate."
-                else: # Handle DataFrame case if structure changes
-                     net_income = ni_series.iloc[0, 0] / 1e12
-                     if ni_series.shape[1] > 1:
-                         prev_net_income = ni_series.iloc[0, 1] / 1e12
-                     else:
-                         st.session_state.setdefault("warnings", {})
-                         st.session_state.warnings[ticker] = f"Fund. Warning: Previous Net Income missing (DataFrame format)."
+        if not financials.empty and "Net Income" in financials.index:
+            ni_series = financials.loc["Net Income"]
+            if not ni_series.empty:
+                try:
+                    # Handle potential MultiIndex or different structures
+                    if isinstance(ni_series, pd.Series):
+                        net_income = ni_series.iloc[0] / 1e12 # Current NI in Trillion IDR
+                        if len(ni_series) > 1:
+                            prev_net_income = ni_series.iloc[1] / 1e12 # Previous NI in Trillion IDR
+                        else:
+                            print(f"[{ticker}] Fund. Warning: Previous Net Income missing (Series format). Growth may be inaccurate.")
+                            st.session_state.setdefault("warnings", {})
+                            st.session_state.warnings[ticker] = f"Fund. Warning: Previous Net Income missing, growth calculation may be inaccurate."
+                    else: # Handle DataFrame case if structure changes
+                         net_income = ni_series.iloc[0, 0] / 1e12
+                         if ni_series.shape[1] > 1:
+                             prev_net_income = ni_series.iloc[0, 1] / 1e12
+                         else:
+                             print(f"[{ticker}] Fund. Warning: Previous Net Income missing (DataFrame format). Growth may be inaccurate.")
+                             st.session_state.setdefault("warnings", {})
+                             st.session_state.warnings[ticker] = f"Fund. Warning: Previous Net Income missing (DataFrame format)."
+                    print(f"[{ticker}] Net Income extracted: Current={net_income:.3f}T, Previous={prev_net_income:.3f}T")
 
-            except (IndexError, TypeError, ValueError, KeyError) as e:
-                 st.session_state.setdefault("errors", {})
-                 st.session_state.errors[ticker] = f"Fund. Error extracting Net Income: {e}"
-                 net_income = None # Mark as invalid if extraction failed
+                except (IndexError, TypeError, ValueError, KeyError) as e:
+                     error_msg = f"Fund. Error extracting Net Income: {e}"
+                     print(f"[{ticker}] {error_msg}")
+                     st.session_state.setdefault("errors", {})
+                     st.session_state.errors[ticker] = error_msg
+                     net_income = None # Mark as invalid if extraction failed
+            else:
+                print(f"[{ticker}] Fund. Warning: 'Net Income' series is empty in financials.")
+                st.session_state.setdefault("warnings", {})
+                st.session_state.warnings[ticker] = f"Fund. Warning: 'Net Income' series is empty in financials."
         else:
+            print(f"[{ticker}] Fund. Warning: 'Net Income' not found or financials empty.")
             st.session_state.setdefault("warnings", {})
             st.session_state.warnings[ticker] = f"Fund. Warning: 'Net Income' not found or empty in yfinance financials."
 
         # --- P/E Ratio ---
         pe_ratio = info.get("trailingPE", None)
         if pe_ratio is None or not isinstance(pe_ratio, (int, float)) or np.isnan(pe_ratio):
+            warning_msg = f"Fund. Warning: Trailing P/E missing or invalid ({pe_ratio}). Will not filter by P/E."
+            print(f"[{ticker}] {warning_msg}")
             st.session_state.setdefault("warnings", {})
-            st.session_state.warnings[ticker] = f"Fund. Warning: Trailing P/E missing or invalid ({pe_ratio}). Will not filter by P/E."
+            st.session_state.warnings[ticker] = warning_msg
             pe_ratio = None # Ensure it's None if invalid
+        else:
+            print(f"[{ticker}] P/E Ratio extracted: {pe_ratio:.2f}")
 
         # --- P/B Ratio ---
         pb_ratio = info.get("priceToBook", None)
         if pb_ratio is None or not isinstance(pb_ratio, (int, float)) or np.isnan(pb_ratio):
+            warning_msg = f"Fund. Warning: P/B ratio missing or invalid ({pb_ratio}). Will not filter by P/B."
+            print(f"[{ticker}] {warning_msg}")
             st.session_state.setdefault("warnings", {})
-            st.session_state.warnings[ticker] = f"Fund. Warning: P/B ratio missing or invalid ({pb_ratio}). Will not filter by P/B."
+            st.session_state.warnings[ticker] = warning_msg
             pb_ratio = None # Ensure it's None if invalid
+        else:
+             print(f"[{ticker}] P/B Ratio extracted: {pb_ratio:.2f}")
 
         # --- Check Essential Data for Filtering ---
-        # We need NI for the NI filter. P/E and P/B filters will be skipped if data is None.
         if net_income is None or not isinstance(net_income, (int, float)) or np.isnan(net_income):
+            error_msg = f"Fund. Error: Net Income is missing or invalid ({net_income}). Cannot apply fundamental filters."
+            print(f"[{ticker}] {error_msg}")
             st.session_state.setdefault("errors", {})
-            st.session_state.errors[ticker] = f"Fund. Error: Net Income is missing or invalid ({net_income}). Cannot apply fundamental filters."
+            st.session_state.errors[ticker] = error_msg
             return None # Cannot proceed without Net Income
 
         # Return collected data (prev_net_income defaults to 0 if missing)
+        print(f"[{ticker}] --- Successfully completed get_fundamentals --- ")
         return (net_income, prev_net_income, pe_ratio, pb_ratio)
 
     except Exception as e:
+        error_msg = f"Fund. yfinance Error: {e}\n{traceback.format_exc()}"
+        print(f"[{ticker}] !!! EXCEPTION in get_fundamentals: {error_msg}")
         st.session_state.setdefault("errors", {})
-        st.session_state.errors[ticker] = f"Fund. yfinance Error: {e}\n{traceback.format_exc()}"
+        st.session_state.errors[ticker] = error_msg
         return None
 
 
 def process_ticker_technical_first(ticker, rsi_min, rsi_max, show_oversold, show_overbought, show_neutral):
     '''
-    Process a single ticker with technical filters first using API data.
+    Process a single ticker with technical filters first (yfinance version).
     Returns: [ticker_symbol, rsi, signal, rsi_history] or None if not matching criteria
     '''
+    print(f"[{ticker}] Processing technical filters...")
     try:
-        # Use the new API-based function
-        rsi_data = get_rsi_from_api(ticker)
+        # Use the yfinance-based function with enhanced logging
+        rsi_data = get_rsi_yfinance(ticker)
         if not rsi_data:
-            # Error/Warning logged in get_rsi_from_api
-            print(f"Skipping {ticker} due to RSI fetch/calc failure.")
+            # Error/Warning logged in get_rsi_yfinance
+            print(f"[{ticker}] Skipping technical processing due to RSI fetch/calc failure.")
             return None
 
         rsi, signal, rsi_history = rsi_data
 
         # Apply RSI range filter
         if (rsi_min > 0 and rsi < rsi_min) or (rsi_max < 100 and rsi > rsi_max):
-            print(f"Filtering out {ticker}: RSI {rsi:.1f} outside range {rsi_min}-{rsi_max}.")
+            print(f"[{ticker}] Filtering out: RSI {rsi:.1f} outside range {rsi_min}-{rsi_max}.")
+            st.session_state.setdefault("filtered_out_technical", {})
+            st.session_state.filtered_out_technical[ticker] = f"Filtered out: RSI {rsi:.1f} outside range {rsi_min}-{rsi_max}."
             return None
 
         # Apply RSI signal filters
         if (signal == "Oversold" and not show_oversold) or \
            (signal == "Overbought" and not show_overbought) or \
            (signal == "Neutral" and not show_neutral):
-            print(f"Filtering out {ticker}: Signal '{signal}' not selected.")
+            print(f"[{ticker}] Filtering out: Signal '{signal}' not selected.")
+            st.session_state.setdefault("filtered_out_technical", {})
+            st.session_state.filtered_out_technical[ticker] = f"Filtered out: Signal '{signal}' not selected."
             return None
 
         ticker_symbol = ticker.replace(".JK", "")
-        print(f"Passed technical filters: {ticker_symbol} (RSI: {rsi:.1f}, Signal: {signal})")
+        print(f"[{ticker}] Passed technical filters: {ticker_symbol} (RSI: {rsi:.1f}, Signal: {signal})")
         return [ticker_symbol, rsi, signal, rsi_history]
 
     except Exception as e:
-        st.session_state.setdefault("errors", {})
         error_msg = f"Tech. Process Error: {e}\n{traceback.format_exc()}"
+        print(f"[{ticker}] !!! EXCEPTION in process_ticker_technical_first: {error_msg}")
+        st.session_state.setdefault("errors", {})
         st.session_state.errors[ticker] = error_msg
-        print(f"Error in process_ticker_technical_first for {ticker}: {error_msg}")
         return None
 
 def apply_fundamental_filters(technical_results, min_ni, max_pe, max_pb, min_growth):
@@ -341,54 +358,64 @@ def apply_fundamental_filters(technical_results, min_ni, max_pe, max_pb, min_gro
     fund_results = {}
     def fetch_fund(ticker_symbol):
         ticker = f"{ticker_symbol}.JK"
+        print(f"[{ticker}] Submitting fundamental fetch job...")
         fund_data = get_fundamentals(ticker)
         if fund_data:
             fund_results[ticker_symbol] = fund_data
+            print(f"[{ticker}] Fundamental data fetch successful.")
         else:
-            print(f"Fundamental data fetch failed for {ticker}")
+            print(f"[{ticker}] Fundamental data fetch failed or returned None.")
             # Error logged in get_fundamentals
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = [executor.submit(fetch_fund, result[0]) for result in technical_results]
         # Wait for all fundamental fetches to complete (or timeout)
-        concurrent.futures.wait(futures, timeout=120) # Add a timeout
+        print(f"Waiting for {len(futures)} fundamental fetch jobs to complete...")
+        concurrent.futures.wait(futures, timeout=180) # Increased timeout
+        print(f"Fundamental fetch jobs complete.")
 
-    print(f"Fundamental data fetched for {len(fund_results)} stocks.")
+    print(f"Fundamental data available for {len(fund_results)} stocks after fetch.")
 
     for result in technical_results:
         ticker_symbol, rsi, signal, rsi_history = result
         ticker = f"{ticker_symbol}.JK"
 
         if ticker_symbol not in fund_results:
-            print(f"Skipping {ticker_symbol}: Fundamental data not available.")
-            continue # Skip if fundamental data fetch failed
+            print(f"[{ticker}] Skipping fundamental filtering: Data not found in results dict.")
+            continue # Skip if fundamental data fetch failed or timed out
 
+        print(f"[{ticker}] Applying fundamental filters...")
         try:
             fund_data = fund_results[ticker_symbol]
             ni, prev_ni, pe, pb = fund_data
 
             # Calculate growth (handle division by zero or invalid prev_ni)
-            growth = 0
-            if prev_ni is not None and prev_ni != 0 and isinstance(prev_ni, (int, float)) and not np.isnan(prev_ni):
-                 # Ensure ni is also valid before calculating growth
+            growth = np.nan # Default to NaN
+            if prev_ni is not None and isinstance(prev_ni, (int, float)) and not np.isnan(prev_ni):
                  if ni is not None and isinstance(ni, (int, float)) and not np.isnan(ni):
-                     growth = ((ni - prev_ni) / abs(prev_ni) * 100)
+                     if prev_ni != 0:
+                         growth = ((ni - prev_ni) / abs(prev_ni) * 100)
+                     elif ni > 0: # Growth from zero
+                         growth = np.inf
+                     elif ni < 0:
+                         growth = -np.inf
+                     else: # ni = 0, prev_ni = 0
+                         growth = 0.0
                  else:
-                     growth = np.nan # Cannot calculate growth if current NI is invalid
-            elif prev_ni == 0 and ni is not None and ni > 0:
-                 growth = np.inf # Positive growth from zero
-            elif prev_ni == 0 and ni is not None and ni < 0:
-                 growth = -np.inf # Negative growth from zero
-            # else growth remains 0 or becomes NaN if NI is invalid
+                     print(f"[{ticker}] Growth Calc Warning: Current NI is invalid ({ni}).")
+            else:
+                 print(f"[{ticker}] Growth Calc Warning: Previous NI is invalid ({prev_ni}).")
+
+            print(f"[{ticker}] Calculated Growth: {growth}")
 
             # Apply fundamental filters, logging reasons for exclusion
             reason = None
             if ni < min_ni:
                 reason = f"NI {ni:.2f}T < {min_ni:.1f}T"
-            # Only filter by PE if pe is valid and max_pe is restrictive (not set to max value)
+            # Only filter by PE if pe is valid and max_pe is restrictive
             elif pe is not None and max_pe < 50.0 and pe > max_pe:
                  reason = f"P/E {pe:.1f} > {max_pe:.1f}"
-            # Only filter by PB if pb is valid and max_pb is restrictive (not set to max value)
+            # Only filter by PB if pb is valid and max_pb is restrictive
             elif pb is not None and max_pb < 5.0 and pb > max_pb:
                  reason = f"P/B {pb:.1f} > {max_pb:.1f}"
             # Only filter by growth if growth is valid and min_growth is restrictive
@@ -400,11 +427,10 @@ def apply_fundamental_filters(technical_results, min_ni, max_pe, max_pb, min_gro
             if reason:
                 st.session_state.setdefault("filtered_out_fundamental", {})
                 st.session_state.filtered_out_fundamental[ticker] = f"Filtered out: {reason}"
-                print(f"Filtering out {ticker}: {reason}")
+                print(f"[{ticker}] Filtering out (Fundamental): {reason}")
                 continue # Skip this stock
 
             # Add to final results
-            # Ensure all values are serializable (replace inf/-inf growth)
             if growth == np.inf: growth_display = "+Inf"
             elif growth == -np.inf: growth_display = "-Inf"
             elif pd.isna(growth): growth_display = "N/A"
@@ -421,25 +447,27 @@ def apply_fundamental_filters(technical_results, min_ni, max_pe, max_pb, min_gro
                 rsi_history, # Keep history for charts
                 growth # Keep original growth for potential sorting later if needed
             ])
-            print(f"Passed fundamental filters: {ticker_symbol}")
+            print(f"[{ticker}] Passed fundamental filters.")
 
         except Exception as e:
-            st.session_state.setdefault("errors", {})
             error_msg = f"Fund. Apply Error: {e}\n{traceback.format_exc()}"
+            print(f"[{ticker}] !!! EXCEPTION applying fundamental filters: {error_msg}")
+            st.session_state.setdefault("errors", {})
             st.session_state.errors[ticker] = error_msg
-            print(f"Error applying fundamental filters for {ticker}: {error_msg}")
 
     print(f"Fundamental filtering complete. {len(final_results)} stocks passed.")
     return final_results
 
 
 @st.cache_data(ttl=300)
-def create_rsi_chart_image(rsi_values, current_rsi):
+def create_rsi_chart_image(rsi_values, current_rsi, ticker="N/A"):
     '''Create a matplotlib chart for RSI values and return as image bytes'''
+    print(f"[{ticker}] Creating RSI chart image...")
     if isinstance(rsi_values, list):
         rsi_values = np.array(rsi_values)
 
     if rsi_values is None or len(rsi_values) == 0:
+        print(f"[{ticker}] Chart Error: No RSI data provided.")
         fig, ax = plt.subplots(figsize=(3, 1.5))
         ax.text(0.5, 0.5, "No RSI Data", ha='center', va='center')
         ax.set_xticks([])
@@ -450,46 +478,61 @@ def create_rsi_chart_image(rsi_values, current_rsi):
         buf.seek(0)
         return buf
 
-    fig, ax = plt.subplots(figsize=(3, 1.5))
-    x = range(len(rsi_values))
-    ax.plot(x, rsi_values, color='blue', linewidth=1.5)
-    ax.axhline(y=OVERBOUGHT_THRESHOLD, color='red', linestyle='--', alpha=0.7, linewidth=1) # Red for overbought
-    ax.axhline(y=OVERSOLD_THRESHOLD, color='green', linestyle='--', alpha=0.7, linewidth=1) # Green for oversold
-    ax.fill_between(x, OVERBOUGHT_THRESHOLD, 100, color='red', alpha=0.1) # Red zone
-    ax.fill_between(x, 0, OVERSOLD_THRESHOLD, color='green', alpha=0.1) # Green zone
-    ax.set_ylim(0, 100)
+    try:
+        fig, ax = plt.subplots(figsize=(3, 1.5))
+        x = range(len(rsi_values))
+        ax.plot(x, rsi_values, color='blue', linewidth=1.5)
+        ax.axhline(y=OVERBOUGHT_THRESHOLD, color='red', linestyle='--', alpha=0.7, linewidth=1)
+        ax.axhline(y=OVERSOLD_THRESHOLD, color='green', linestyle='--', alpha=0.7, linewidth=1)
+        ax.fill_between(x, OVERBOUGHT_THRESHOLD, 100, color='red', alpha=0.1)
+        ax.fill_between(x, 0, OVERSOLD_THRESHOLD, color='green', alpha=0.1)
+        ax.set_ylim(0, 100)
 
-    # Dynamic X-axis ticks based on RSI_PERIOD length
-    num_ticks = min(5, len(rsi_values)) # Show up to 5 ticks
-    tick_indices = np.linspace(0, len(rsi_values) - 1, num_ticks, dtype=int)
-    tick_labels = [f"D-{len(rsi_values)-1-i}" for i in tick_indices]
-    ax.set_xticks(tick_indices)
-    ax.set_xticklabels(tick_labels, fontsize=7, rotation=30, ha='right')
+        num_ticks = min(5, len(rsi_values))
+        tick_indices = np.linspace(0, len(rsi_values) - 1, num_ticks, dtype=int)
+        tick_labels = [f"D-{len(rsi_values)-1-i}" for i in tick_indices]
+        ax.set_xticks(tick_indices)
+        ax.set_xticklabels(tick_labels, fontsize=7, rotation=30, ha='right')
 
-    ax.set_yticks([0, OVERSOLD_THRESHOLD, 50, OVERBOUGHT_THRESHOLD, 100])
-    ax.set_yticklabels(['0', str(OVERSOLD_THRESHOLD), '50', str(OVERBOUGHT_THRESHOLD), '100'], fontsize=8)
+        ax.set_yticks([0, OVERSOLD_THRESHOLD, 50, OVERBOUGHT_THRESHOLD, 100])
+        ax.set_yticklabels(['0', str(OVERSOLD_THRESHOLD), '50', str(OVERBOUGHT_THRESHOLD), '100'], fontsize=8)
 
-    # Add current RSI value text slightly offset
-    text_x_pos = len(rsi_values) - 1
-    text_y_pos = current_rsi + 5 if current_rsi < 95 else current_rsi - 5 # Adjust position to avoid overlap
-    ax.text(text_x_pos, text_y_pos, f'{current_rsi:.1f}', verticalalignment='center', horizontalalignment='right', fontsize=9, color='black', fontweight='bold')
-    ax.scatter(len(rsi_values)-1, current_rsi, color='blue', s=30, zorder=5)
+        text_x_pos = len(rsi_values) - 1
+        text_y_pos = current_rsi + 5 if current_rsi < 95 else current_rsi - 5
+        ax.text(text_x_pos, text_y_pos, f'{current_rsi:.1f}', verticalalignment='center', horizontalalignment='right', fontsize=9, color='black', fontweight='bold')
+        ax.scatter(len(rsi_values)-1, current_rsi, color='blue', s=30, zorder=5)
 
-    ax.set_title(f"RSI({RSI_PERIOD}) Chart", fontsize=10)
-    for spine in ax.spines.values():
-        spine.set_visible(False)
-    plt.tight_layout(pad=0.2) # Adjust padding
+        ax.set_title(f"RSI({RSI_PERIOD}) Chart", fontsize=10)
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+        plt.tight_layout(pad=0.2)
 
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
-    plt.close(fig)
-    buf.seek(0)
-    return buf
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+        plt.close(fig)
+        buf.seek(0)
+        print(f"[{ticker}] RSI chart image created successfully.")
+        return buf
+    except Exception as e:
+        error_msg = f"Chart Creation Error: {e}"
+        print(f"[{ticker}] !!! EXCEPTION creating chart: {error_msg}")
+        st.session_state.setdefault("errors", {})
+        st.session_state.errors[f"{ticker}_chart"] = error_msg
+        # Return a placeholder image or re-raise?
+        fig, ax = plt.subplots(figsize=(3, 1.5))
+        ax.text(0.5, 0.5, "Chart Error", ha='center', va='center')
+        ax.set_xticks([])
+        ax.set_yticks([])
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png')
+        plt.close(fig)
+        buf.seek(0)
+        return buf
 
 def process_batch_technical_first(batch_tickers, rsi_min, rsi_max, show_oversold, show_overbought, show_neutral):
-    '''Process a batch of tickers with technical filters first using API.'''
+    '''Process a batch of tickers with technical filters first (yfinance version).'''
     results = []
-    print(f"Processing technical batch of {len(batch_tickers)} tickers...")
+    print(f"--- Processing technical batch of {len(batch_tickers)} tickers ({batch_tickers[0]}...{batch_tickers[-1]}) ---")
     process_func = partial(
         process_ticker_technical_first,
         rsi_min=rsi_min,
@@ -498,28 +541,33 @@ def process_batch_technical_first(batch_tickers, rsi_min, rsi_max, show_oversold
         show_overbought=show_overbought,
         show_neutral=show_neutral
     )
-    # Using ThreadPoolExecutor for I/O bound API calls
+    # Using ThreadPoolExecutor for I/O bound yfinance calls
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_ticker = {executor.submit(process_func, ticker): ticker for ticker in batch_tickers}
+        print(f"Submitted {len(future_to_ticker)} technical jobs to executor.")
+        processed_count = 0
         for future in concurrent.futures.as_completed(future_to_ticker):
             ticker = future_to_ticker[future]
+            processed_count += 1
+            print(f"({processed_count}/{len(future_to_ticker)}) Future completed for {ticker}")
             try:
                 result = future.result()
                 if result is not None:
                     results.append(result)
+                    print(f"Result added for {ticker}")
             except Exception as exc:
+                 error_msg = f'Tech. Batch Error processing future for {ticker}: {exc}'
+                 print(f"!!! EXCEPTION {error_msg}")
                  st.session_state.setdefault("errors", {})
-                 error_msg = f'Tech. Batch Error: {exc}'
                  st.session_state.errors[ticker] = error_msg
-                 print(f"Error processing future for {ticker}: {error_msg}")
 
-    print(f"Technical batch processing complete. {len(results)} passed.")
+    print(f"--- Technical batch processing complete. {len(results)} passed. ---")
     return results
 
 
 def main():
     st.set_page_config(
-        page_title="IDX Stock Screener V3 (API)", # Updated Title
+        page_title="IDX Stock Screener V4 (Debug)", # Updated Title
         page_icon="📈",
         layout="wide",
         initial_sidebar_state="expanded"
@@ -564,14 +612,15 @@ def main():
     # App header
     col1, col2 = st.columns([3, 1])
     with col1:
-        st.title("IDX Stock Screener V3 (API)") # Updated Title
-        st.markdown(f"Screening **{len(IDX_ALL_TICKERS_YF)}** Indonesian stocks (Technical [API] first, then Fundamental [yfinance])")
+        st.title("IDX Stock Screener V4 (Debug)") # Updated Title
+        st.markdown(f"Screening **{len(IDX_ALL_TICKERS_YF)}** Indonesian stocks (Technical [yfinance] first, then Fundamental [yfinance])")
     with col2:
         st.metric("Total IDX Stocks", f"{len(IDX_ALL_TICKERS_YF)}")
 
     # Initialize session state
     if "errors" not in st.session_state: st.session_state.errors = {}
     if "warnings" not in st.session_state: st.session_state.warnings = {} # Added warnings log
+    if "filtered_out_technical" not in st.session_state: st.session_state.filtered_out_technical = {}
     if "filtered_out_fundamental" not in st.session_state: st.session_state.filtered_out_fundamental = {}
     if "last_refresh" not in st.session_state: st.session_state.last_refresh = None
     if "results_cache" not in st.session_state: st.session_state.results_cache = None
@@ -591,11 +640,10 @@ def main():
         tab1, tab2, tab3, tab4 = st.tabs(["Technical", "Fundamental", "Performance", "Settings"])
 
         with tab1:
-            st.subheader("Technical Filters (First Pass - API)")
+            st.subheader("Technical Filters (First Pass - yfinance)")
             st.caption(f"RSI Period: {RSI_PERIOD} days (Wilder's Smoothing)")
-            # Use tuple for slider value to represent range
             rsi_range = st.slider("RSI Range", 0, 100, (st.session_state.filter_settings["rsi_min"], st.session_state.filter_settings["rsi_max"]), help="Filter stocks by RSI value range.")
-            rsi_min, rsi_max = rsi_range # Unpack the tuple
+            rsi_min, rsi_max = rsi_range
             show_oversold = st.checkbox("Show Oversold (RSI < 30)", st.session_state.filter_settings["show_oversold"])
             show_overbought = st.checkbox("Show Overbought (RSI > 70)", st.session_state.filter_settings["show_overbought"])
             show_neutral = st.checkbox("Show Neutral (30 <= RSI <= 70)", st.session_state.filter_settings["show_neutral"])
@@ -616,7 +664,7 @@ def main():
             st.subheader("Refresh & Debug")
             refresh = st.toggle("Auto-refresh", False, help="Automatically refresh data periodically.")
             refresh_interval = st.slider("Refresh Interval (minutes)", 1, 60, 10, help="Time between refreshes.") if refresh else 0
-            show_logs = st.checkbox("Show Debug Logs", False, help="Display detailed error and warning logs.")
+            show_logs = st.checkbox("Show Debug Logs", True, help="Display detailed error and warning logs.") # Default to True for debugging
 
         # Update session state with current filter settings if they changed
         current_filters = {
@@ -626,6 +674,7 @@ def main():
         }
         filters_changed = (current_filters != st.session_state.filter_settings)
         if filters_changed:
+            print("Filters changed, clearing cache.")
             st.session_state.filter_settings = current_filters
             st.session_state.results_cache = None # Clear cache if filters change
 
@@ -645,20 +694,18 @@ def main():
         final_results_placeholder = st.empty()
 
     with main_tab2:
-        st.subheader("About IDX Stock Screener V3 (API)")
+        st.subheader("About IDX Stock Screener V4 (Debug)")
         st.markdown(f'''
         This application screens all **{len(IDX_ALL_TICKERS_YF)}** stocks listed on the Indonesia Stock Exchange (IDX).
-        - **Technical Screening (First Pass):** Uses the **YahooFinance API** to fetch historical data and filters by RSI({RSI_PERIOD}) value and signal (Oversold < {OVERSOLD_THRESHOLD}, Overbought > {OVERBOUGHT_THRESHOLD}). Uses Wilder's Smoothing.
+        - **Technical Screening (First Pass):** Uses the **yfinance library** to fetch historical data and filters by RSI({RSI_PERIOD}) value and signal (Oversold < {OVERSOLD_THRESHOLD}, Overbought > {OVERBOUGHT_THRESHOLD}). Uses Wilder's Smoothing.
         - **Fundamental Screening (Second Pass):** Uses the **yfinance library** to fetch fundamental data and applies filters for Net Income, P/E Ratio, P/B Ratio, and YoY Growth to the stocks that passed the technical screen.
         - **Data:** Technical data cached for 5 mins, Fundamental data for 24 hours.
-        - **Improvements (V3):** Switched technical data fetching to direct API calls for potentially better reliability in cloud environments.
+        - **Improvements (V4 Debug):** Reverted to yfinance for technical data. Added extensive logging to diagnose potential issues.
         ''')
 
         st.subheader("Current Filter Settings")
         filter_summary = st.session_state.filter_settings.copy()
-        # Format RSI range for display
         filter_summary["RSI Range"] = f"{filter_summary.pop('rsi_min')} - {filter_summary.pop('rsi_max')}"
-        # Reorder for clarity
         ordered_summary = {
             "RSI Range": filter_summary.pop("RSI Range"),
             "Show Oversold": filter_summary.pop("show_oversold"),
@@ -671,19 +718,20 @@ def main():
         }
         st.dataframe(pd.Series(ordered_summary), use_container_width=True)
 
-        if show_logs:
-            st.subheader("Debug Logs")
-            with st.expander("Warnings (Data Issues)", expanded=False):
-                if st.session_state.warnings: st.json(st.session_state.warnings)
-                else: st.write("No warnings logged.")
-            with st.expander("Errors (Failed Operations)", expanded=False):
-                 if st.session_state.errors: st.json(st.session_state.errors)
-                 else: st.write("No errors logged.")
-            with st.expander("Filtered Out (Fundamental Stage)", expanded=False):
-                 if st.session_state.filtered_out_fundamental: st.json(st.session_state.filtered_out_fundamental)
-                 else: st.write("No stocks logged as filtered out during fundamental screening.")
-        else:
-             st.info("Enable 'Show Debug Logs' in Settings tab (Sidebar) to view detailed logs.")
+        # Always show logs in this debug version
+        st.subheader("Debug Logs")
+        with st.expander("Warnings (Data Issues)", expanded=False):
+            if st.session_state.warnings: st.json(st.session_state.warnings)
+            else: st.write("No warnings logged.")
+        with st.expander("Errors (Failed Operations)", expanded=False):
+             if st.session_state.errors: st.json(st.session_state.errors)
+             else: st.write("No errors logged.")
+        with st.expander("Filtered Out (Technical Stage)", expanded=False):
+             if st.session_state.get("filtered_out_technical"): st.json(st.session_state.filtered_out_technical)
+             else: st.write("No stocks logged as filtered out during technical screening.")
+        with st.expander("Filtered Out (Fundamental Stage)", expanded=False):
+             if st.session_state.filtered_out_fundamental: st.json(st.session_state.filtered_out_fundamental)
+             else: st.write("No stocks logged as filtered out during fundamental screening.")
 
 
     # Check if refresh is needed
@@ -700,19 +748,23 @@ def main():
 
     # --- Screening Logic ---
     def perform_screening():
+        print("===== Starting Screening Process ====")
         technical_results = []
         final_results_data = [] # Store raw data before formatting for display/CSV
         start_time = time.time()
 
         # Clear previous logs
+        print("Clearing previous logs...")
         st.session_state.errors = {}
         st.session_state.warnings = {}
+        st.session_state.filtered_out_technical = {}
         st.session_state.filtered_out_fundamental = {}
 
-        # --- FIRST PASS: Technical Screening (Using API) ---
+        # --- FIRST PASS: Technical Screening (Using yfinance) ---
         num_batches = (len(IDX_ALL_TICKERS_YF) + batch_size - 1) // batch_size
-        status_text.text("Starting Technical Screening (API)...")
-        progress_bar.progress(0, text="Technical Screening (API): Batch 1")
+        status_text.text("Starting Technical Screening (yfinance)...")
+        progress_bar.progress(0, text="Technical Screening (yfinance): Batch 1")
+        print(f"Starting Technical Screening: {len(IDX_ALL_TICKERS_YF)} tickers, {num_batches} batches.")
 
         for batch_idx in range(num_batches):
             batch_start = batch_idx * batch_size
@@ -720,7 +772,8 @@ def main():
             batch_tickers = IDX_ALL_TICKERS_YF[batch_start:batch_end]
 
             progress = (batch_idx + 1) / (num_batches * 2) # Technical is first half
-            progress_text = f"Technical Screening (API): Batch {batch_idx + 1}/{num_batches} ({len(batch_tickers)} tickers)"
+            progress_text = f"Technical Screening (yfinance): Batch {batch_idx + 1}/{num_batches} ({len(batch_tickers)} tickers)"
+            print(f"=== Processing Batch {batch_idx + 1}/{num_batches} ===")
             progress_bar.progress(progress, text=progress_text)
             status_text.text(progress_text)
 
@@ -733,6 +786,7 @@ def main():
                 st.session_state.filter_settings["show_neutral"]
             )
             technical_results.extend(batch_tech_results)
+            print(f"Batch {batch_idx + 1} complete. Current total technical results: {len(technical_results)}")
 
         # Remove duplicates after technical screening (if any)
         seen_tickers_tech = set()
@@ -744,6 +798,7 @@ def main():
         technical_results = unique_technical_results
         tech_count = len(technical_results)
 
+        print(f"Technical Screening Complete. Total unique stocks passed: {tech_count}")
         progress_bar.progress(0.5, text=f"Technical Screening Complete ({tech_count} passed)")
         status_text.text(f"Technical Screening Complete: Found {tech_count} stocks")
 
@@ -751,15 +806,16 @@ def main():
         with technical_results_placeholder.container():
             if technical_results:
                  st.subheader(f"Technical Screening Results ({tech_count} Stocks)")
-                 # Format RSI for display in this table
                  tech_df = pd.DataFrame([(t[0], f"{t[1]:.1f}", t[2]) for t in technical_results], columns=["Ticker", "RSI", "Signal"])
                  st.dataframe(tech_df, height=300, use_container_width=True)
             else:
                  st.info("No stocks passed the technical screening.")
+                 print("No stocks passed technical screening phase.")
 
 
         # --- SECOND PASS: Fundamental Screening (Using yfinance) ---
         if technical_results:
+            print(f"Starting Fundamental Screening for {tech_count} stocks...")
             status_text.text(f"Starting Fundamental Screening (yfinance) for {tech_count} stocks...")
             progress_bar.progress(0.5, text="Fundamental Screening (yfinance)...")
 
@@ -772,7 +828,7 @@ def main():
                 st.session_state.filter_settings["min_growth"]
             )
 
-            # Remove duplicates after fundamental screening (shouldn't happen if tech results were unique)
+            # Remove duplicates after fundamental screening (shouldn't happen)
             seen_tickers_final = set()
             unique_final_results = []
             for result in final_results_data:
@@ -782,28 +838,34 @@ def main():
             final_results_data = unique_final_results
             final_count = len(final_results_data)
 
+            print(f"Fundamental Screening Complete. Total stocks passed all filters: {final_count}")
             progress_bar.progress(1.0, text=f"Screening Complete ({final_count} passed all filters)")
             status_text.text(f"Screening Complete: Found {final_count} stocks matching all criteria")
         else:
              # Skip fundamental if no technical results
              final_count = 0
+             print("Skipping Fundamental Screening as no stocks passed technical.")
              progress_bar.progress(1.0, text="Screening Complete (0 passed technical)")
              status_text.text("Screening Complete: No stocks passed technical filters.")
 
 
         # --- Store Results and Performance ---
         elapsed_time = time.time() - start_time
+        print(f"Screening took {elapsed_time:.2f} seconds.")
         st.session_state.last_refresh = current_time
         st.session_state.results_cache = {
-            "technical_results": technical_results, # Store raw tech results if needed later
-            "final_results_data": final_results_data, # Store raw final results
+            "technical_results": technical_results,
+            "final_results_data": final_results_data,
             "technical_count": tech_count,
             "final_count": final_count,
             "elapsed_time": elapsed_time,
             "errors_count": len(st.session_state.errors),
             "warnings_count": len(st.session_state.warnings),
-            "filtered_out_count": len(st.session_state.filtered_out_fundamental)
+            "filtered_out_tech_count": len(st.session_state.filtered_out_technical),
+            "filtered_out_fund_count": len(st.session_state.filtered_out_fundamental)
         }
+        print(f"Results cached. Errors: {len(st.session_state.errors)}, Warnings: {len(st.session_state.warnings)}, Filtered Tech: {len(st.session_state.filtered_out_technical)}, Filtered Fund: {len(st.session_state.filtered_out_fundamental)}")
+        print("===== Screening Process Finished ====")
 
     # --- Run Screening or Load from Cache ---
     if need_refresh:
@@ -812,10 +874,12 @@ def main():
         # Load from cache
         status_text.text(f"Loaded cached results from {st.session_state.last_refresh.strftime('%Y-%m-%d %H:%M:%S')}")
         progress_bar.progress(1.0, text="Screening Complete (Cached)")
+        print("Loaded results from cache.")
     else:
         # Initial state or cache cleared
         status_text.text("Ready to run screener.")
         progress_bar.progress(0, text="Status: Idle")
+        print("App loaded, ready to run screener.")
 
 
     # --- Display Final Results ---
@@ -834,19 +898,20 @@ def main():
 
             # Add RSI Chart column (using base64 encoded images)
             rsi_charts_html = []
+            print(f"Generating {len(final_results_data)} RSI chart images...")
             for i, result in enumerate(final_results_data):
                  ticker, _, _, _, _, rsi_str, _, rsi_history, _ = result # Unpack
                  try:
                      rsi_float = float(rsi_str) # Convert formatted RSI back to float for chart function
-                     chart_img_bytes = create_rsi_chart_image(rsi_history, rsi_float)
+                     chart_img_bytes = create_rsi_chart_image(rsi_history, rsi_float, ticker=ticker)
                      img_base64 = base64.b64encode(chart_img_bytes.getvalue()).decode()
-                     # Smaller chart in table, link to larger view could be added
                      rsi_charts_html.append(f'<img src="data:image/png;base64,{img_base64}" alt="RSI Chart for {ticker}" style="max-height: 50px;">')
                  except Exception as e:
+                     print(f"[{ticker}] Error generating chart image: {e}")
                      rsi_charts_html.append("Chart Error")
                      st.session_state.setdefault("errors", {})
                      st.session_state.errors[f"{ticker}_chart"] = f"Chart Error: {e}"
-
+            print("RSI chart image generation complete.")
 
             display_df["RSI Chart"] = rsi_charts_html
 
@@ -862,13 +927,14 @@ def main():
             st.download_button(
                 label="Download Results as CSV",
                 data=csv,
-                file_name='idx_screener_results_v3_api.csv',
+                file_name='idx_screener_results_v4_debug.csv',
                 mime='text/csv',
             )
 
         elif st.session_state.results_cache: # Results exist but count is 0
             st.warning("⚠️ No stocks found matching all criteria.")
-            st.info("Try relaxing the filters (especially Fundamental filters like P/E, P/B, Net Income) or check the Debug Logs in the 'About & Logs' tab for potential data issues.")
+            st.info("Try relaxing the filters or check the Debug Logs in the 'About & Logs' tab for potential data issues (e.g., yfinance errors, missing data).")
+            print("Displaying 'No stocks found' message.")
         else: # No results cache yet (initial load)
              st.info("Click 'Run Screener Now' in the sidebar to start.")
 
@@ -876,18 +942,20 @@ def main():
 if __name__ == "__main__":
     # --- Enhanced Error Catching Wrapper ---
     try:
-        print("Attempting to run main() function...")
+        print("===== Application Start =====")
         main()
-        print("main() function completed without top-level error.")
+        print("===== Application main() finished normally =====")
     except Exception as e:
-        print(f"ERROR: An exception occurred while running main(): {e}")
+        print(f"!!! TOP LEVEL ERROR: An exception occurred while running main(): {e}")
         # Display error in Streamlit app
         st.set_page_config(page_title="App Error", layout="wide")
         st.title("🚨 Application Error")
         st.error("An unexpected error occurred while running the application. Please see the details below:")
         st.exception(e)
         # Also print traceback to logs for debugging
-        print("--- TRACEBACK START ---")
+        print("--- TOP LEVEL TRACEBACK START ---")
         traceback.print_exc()
-        print("--- TRACEBACK END ---")
+        print("--- TOP LEVEL TRACEBACK END ---")
+        print("===== Application finished due to top-level error =====")
+
 
