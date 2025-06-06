@@ -612,7 +612,7 @@ def main():
     # App header
     col1, col2 = st.columns([3, 1])
     with col1:
-        st.title("IDX Stock Screener V4 (Debug)") # Updated Title
+        st.title("IDX Stock Screener V4 (RSI)") # Updated Title
         st.markdown(f"Screening **{len(IDX_ALL_TICKERS_YF)}** Indonesian stocks (Technical [yfinance] first, then Fundamental [yfinance])")
     with col2:
         st.metric("Total IDX Stocks", f"{len(IDX_ALL_TICKERS_YF)}")
